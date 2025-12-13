@@ -23,6 +23,16 @@ PERFORMANCE OPTIMIZATIONS:
 - Cached spinor stacks for repeated computations
 """
 from __future__ import annotations
+import os
+
+# FIX CORE-NEW-001: Configure threading BEFORE importing numpy/scipy
+# BLAS libraries read these at import time
+_num_threads = os.cpu_count() or 4
+os.environ.setdefault('OMP_NUM_THREADS', str(_num_threads))
+os.environ.setdefault('OPENBLAS_NUM_THREADS', str(_num_threads))
+os.environ.setdefault('MKL_NUM_THREADS', str(_num_threads))
+os.environ.setdefault('NUMEXPR_NUM_THREADS', str(_num_threads))
+
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Literal, Dict, Any
 from math import factorial as math_factorial
@@ -32,17 +42,8 @@ from numpy.typing import NDArray
 from scipy.special import sph_harm, genlaguerre, eval_genlaguerre, gamma as scipy_gamma
 from scipy.integrate import quad, solve_ivp
 import logging
-import os
 from concurrent.futures import ThreadPoolExecutor
 import threading
-
-# Configure NumPy/OpenBLAS threading
-# Set these BEFORE importing numpy in production, but we set after for flexibility
-_num_threads = os.cpu_count() or 4
-os.environ.setdefault('OMP_NUM_THREADS', str(_num_threads))
-os.environ.setdefault('OPENBLAS_NUM_THREADS', str(_num_threads))
-os.environ.setdefault('MKL_NUM_THREADS', str(_num_threads))
-os.environ.setdefault('NUMEXPR_NUM_THREADS', str(_num_threads))
 
 # Try to import numba for JIT compilation
 try:
@@ -50,7 +51,8 @@ try:
     NUMBA_AVAILABLE = True
     # Set numba thread count
     set_num_threads(_num_threads)
-except ImportError:
+except Exception as e:
+    # FIX BUG-001: Catch all exceptions (LLVM/llvmlite failures, etc.)
     NUMBA_AVAILABLE = False
     # Create dummy decorator
     def jit(*args, **kwargs):
@@ -58,6 +60,9 @@ except ImportError:
             return func
         return decorator
     prange = range
+    # Log the failure reason (logger not yet configured, use print)
+    import sys
+    print(f"Numba disabled: {type(e).__name__}: {e}", file=sys.stderr)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -84,6 +89,17 @@ def get_executor() -> ThreadPoolExecutor:
         if _executor is None:
             _executor = ThreadPoolExecutor(max_workers=_num_threads)
     return _executor
+
+def _shutdown_executor():
+    """FIX BUG-008: Clean shutdown of thread pool on exit."""
+    global _executor
+    with _executor_lock:
+        if _executor is not None:
+            _executor.shutdown(wait=False)
+            _executor = None
+
+import atexit
+atexit.register(_shutdown_executor)
 
 
 # =============================================================================
@@ -147,7 +163,7 @@ def _compute_superposition_fast(
                         out_imag[comp, i, j, k] += cr * si + ci * sr
 
 
-@jit(nopython=True, parallel=True, cache=True)
+@jit(nopython=True, cache=True)  # FIX DIRAC-001: Removed parallel=True to avoid race condition
 def _radial_binning_fast(
     r_flat: ArrayR,
     density_flat: ArrayR,
@@ -156,6 +172,9 @@ def _radial_binning_fast(
 ) -> Tuple[ArrayR, ArrayR]:
     """
     Fast radial binning using numba.
+    
+    NOTE: parallel=True removed due to race condition when updating
+    shared counts/sums arrays from multiple threads.
     """
     n_bins = len(bin_edges) - 1
     counts = np.zeros(n_bins, dtype=np.float64)
@@ -163,7 +182,7 @@ def _radial_binning_fast(
     
     n_points = len(r_flat)
     
-    for i in prange(n_points):
+    for i in range(n_points):  # FIX: Changed from prange to range
         r = r_flat[i]
         d = density_flat[i]
         w = weights[i]
@@ -205,9 +224,9 @@ def _compute_color_volume_spin(
     psi_real: ArrayR,
     psi_imag: ArrayR
 ) -> ArrayR:
-    """Compute spin color volume: P_up - P_down."""
+    """Compute spin color volume: P_up - P_down, normalized to [0,1]."""
     shape = psi_real.shape[1:]  # (nx, ny, nz)
-    result = np.empty(shape, dtype=np.float32)
+    result = np.empty(shape, dtype=np.float64)  # Use float64 for consistent typing
     
     for i in prange(shape[0]):
         for j in range(shape[1]):
@@ -220,12 +239,18 @@ def _compute_color_volume_spin(
                           psi_real[3, i, j, k]**2 + psi_imag[3, i, j, k]**2)
                 result[i, j, k] = p_up - p_down
     
-    # Normalize to [0, 1]
+    # Normalize to [0, 1] using in-place operations to maintain type consistency
     mx = np.abs(result).max()
     if mx > 0:
-        result = result / mx * 0.5 + 0.5
+        for i in prange(shape[0]):
+            for j in range(shape[1]):
+                for k in range(shape[2]):
+                    result[i, j, k] = result[i, j, k] / mx * 0.5 + 0.5
     else:
-        result[:] = 0.5
+        for i in prange(shape[0]):
+            for j in range(shape[1]):
+                for k in range(shape[2]):
+                    result[i, j, k] = 0.5
     
     return result
 
@@ -532,13 +557,17 @@ def hydrogenic_dirac_radial(n: int, kappa: int, r: ArrayR, Z: int) -> Tuple[Arra
     if n_r < 0:
         raise ValueError(f"n_r = n - l - 1 = {n} - {l} - 1 < 0")
     
-    # Bohr radius in natural units
-    a0 = 1.0 / (Z * ALPHA_FS)
+    # FIX DIRAC-002: Corrected Z-scaling
+    # Use a0 = 1/α (Bohr radius for Z=1 in natural units)
+    # Then rho = 2*Z*r/(n*a0) = 2*Z*α*r/n
+    # This avoids double-counting Z that occurred with a0 = 1/(Z*α)
+    a0 = 1.0 / ALPHA_FS  # Bohr radius for Z=1
     
     # Scaled radial coordinate
     rho = 2.0 * Z * r / (n * a0)
     
     # Non-relativistic radial function normalization
+    # N_nl = sqrt((2Z/(n*a0))^3 * (n-l-1)! / (2n*(n+l)!))
     N_nl = np.sqrt((2*Z/(n*a0))**3 * math_factorial(n-l-1) / (2*n*math_factorial(n+l)))
     
     # Laguerre polynomial
@@ -562,7 +591,8 @@ def hydrogenic_dirac_radial(n: int, kappa: int, r: ArrayR, Z: int) -> Tuple[Arra
     
     # Dirac components
     G = r * R_nl
-    F = (Z * ALPHA_FS) * r * R_nl * (kappa / abs_k) * np.sqrt((1.0 - E)/(1.0 + E))
+    # FIX: Use za (= Z*α) directly, not Z*ALPHA_FS again since za already defined
+    F = za * r * R_nl * (kappa / abs_k) * np.sqrt((1.0 - E)/(1.0 + E))
     
     return np.asarray(G, dtype=float), np.asarray(F, dtype=float)
 
@@ -638,7 +668,10 @@ def check_e1_selection_rules(state_i: DiracState, state_f: DiracState,
         violations.append("j=0→j=0 forbidden")
     
     # Δmj rule depends on polarization
-    delta_m = mj_f - mj_i
+    # FIX DIRAC-003: Convert Δm to int via rounding to avoid float precision issues
+    # mj values are half-integers, so their difference should be an integer
+    delta_m_float = mj_f - mj_i
+    delta_m = int(round(delta_m_float))
     allowed_delta_m = []
     
     if polarization is not None:
@@ -650,7 +683,7 @@ def check_e1_selection_rules(state_i: DiracState, state_f: DiracState,
         allowed_delta_m = [-1, 0, 1]
     
     if delta_m not in allowed_delta_m:
-        violations.append(f"Δmj={delta_m:.1f} not allowed for given polarization")
+        violations.append(f"Δmj={delta_m} not allowed for given polarization")
     
     if violations:
         return False, "; ".join(violations), allowed_delta_m
@@ -779,6 +812,8 @@ class DiracSolver:
         self._sph_harm_cache.clear()
         self._spinor_stack_valid = False
         self._rebuild_states()
+        # FIX NEW-002: Refresh transition if in driven mode
+        self._refresh_transition_if_driven()
 
     def ensure_grid_for_bound_states(self, safety_factor: float = 5.0) -> None:
         """Expand grid to contain all bound states if needed."""
@@ -864,10 +899,23 @@ class DiracSolver:
         self._dipole_cache.clear()
         self._spinor_stack_valid = False
         self._rebuild_states()
+        # FIX NEW-002: Refresh transition if in driven mode
+        self._refresh_transition_if_driven()
 
     def update_field(self, new_field: FieldConfig) -> None:
+        """Update field configuration with proper cache invalidation."""
+        old_Z = self.field.Z
         self.field = new_field
         self.hamiltonian.field = new_field
+        # FIX BUG-004: Sync include_coulomb and invalidate caches
+        self.hamiltonian.include_coulomb = new_field.enable_coulomb
+        self._dipole_cache.clear()
+        self._spinor_stack_valid = False
+        
+        # FIX NEW-003: If Z changed, rebuild bound states
+        if new_field.Z != old_Z and new_field.enable_coulomb:
+            self._rebuild_states()
+            self._refresh_transition_if_driven()
 
     # -------------------------------------------------------------------------
     # Evolution Mode
@@ -886,6 +934,22 @@ class DiracSolver:
                 transition_config = TransitionConfig(state_i=0, state_f=1)
             self.hamiltonian.transition = transition_config
             self._setup_transition()
+        else:
+            # FIX BUG-003: Clear transition when switching to stationary
+            self.hamiltonian.transition = None
+
+    def _refresh_transition_if_driven(self) -> None:
+        """FIX NEW-002: Recompute transition parameters if in driven mode after state rebuild."""
+        if self.hamiltonian.evolution_mode == "driven" and self.hamiltonian.transition is not None:
+            trans = self.hamiltonian.transition
+            n_states = self.superposition.n_states()
+            # Validate indices still valid
+            if trans.state_i < n_states and trans.state_f < n_states:
+                self._setup_transition()
+            else:
+                # Indices invalid after rebuild, switch to stationary
+                logger.warning("Transition state indices invalid after rebuild, switching to stationary")
+                self.set_evolution_mode("stationary")
 
     def _setup_transition(self) -> None:
         """Compute dipole matrix elements and setup transition parameters."""
@@ -957,9 +1021,12 @@ class DiracSolver:
         if abs(l_f - l_i) != 1:
             return {-1: 0.0, 0: 0.0, 1: 0.0}, np.zeros(3, dtype=np.complex128)
         
+        # FIX DIRAC-003: Use int(round()) for comparison to avoid float precision issues
+        delta_m = int(round(mj_f - mj_i))
+        
         dipole_sph = {}
         for q in [-1, 0, 1]:
-            if mj_f - mj_i != q:
+            if delta_m != q:
                 dipole_sph[q] = 0.0
             else:
                 R_val = self._radial_dipole_integral(n_i, k_i, n_f, k_f, Z)
@@ -990,7 +1057,9 @@ class DiracSolver:
 
     def _angular_dipole_coefficient(self, k_i: int, mj_i: float, k_f: int, mj_f: float, q: int) -> float:
         """Angular coefficient for E1 matrix element."""
-        if mj_f - mj_i != q:
+        # FIX DIRAC-003: Use int(round()) for comparison
+        delta_m = int(round(mj_f - mj_i))
+        if delta_m != q:
             return 0.0
         
         l_i, j_i = kappa_to_l_j(k_i)
@@ -1087,6 +1156,10 @@ class DiracSolver:
             raise ValueError(f"n must be > l={l} for κ={kappa}")
         if abs(mj) > j + 1e-8:
             raise ValueError(f"|mj| must be ≤ j={j}")
+        # FIX CORE-NEW-002: Validate mj is a half-integer (2*mj must be an integer)
+        twice_mj = 2 * mj
+        if abs(twice_mj - round(twice_mj)) > 1e-8:
+            raise ValueError(f"mj must be a half-integer, got {mj}")
 
     def _build_bound_state(self, n: int, kappa: int, mj: float) -> DiracState:
         """Build a bound state with correct radial functions and normalization."""
@@ -1653,11 +1726,30 @@ class DiracSolver:
                            metadata=np.array([metadata], dtype=object))
 
     def load_configuration(self, filename: str) -> None:
-        """Load complete configuration."""
+        """
+        Load complete configuration.
+        
+        FIX IO-001: Corrected metadata parsing and added proper cache invalidation.
+        """
         data = np.load(filename, allow_pickle=True)
         spinors = data["spinors"]
         coeffs = data["coeffs"]
-        metadata = data["metadata"][0].item()
+        
+        # FIX IO-001: Handle both array formats for metadata
+        # Old format saved as np.array([metadata], dtype=object) -> shape (1,)
+        # The [0] gives us the dict, but it might not need .item()
+        metadata_raw = data["metadata"]
+        if metadata_raw.ndim == 0:
+            # 0-d object array
+            metadata = metadata_raw.item()
+        elif metadata_raw.ndim == 1 and len(metadata_raw) > 0:
+            # 1-d array with dict at index 0
+            metadata = metadata_raw[0]
+            # Only call .item() if it's an ndarray, not if it's already a dict
+            if isinstance(metadata, np.ndarray):
+                metadata = metadata.item()
+        else:
+            metadata = {}
         
         g = metadata.get("grid", {})
         self.grid = DiracGridConfig(
@@ -1672,6 +1764,8 @@ class DiracSolver:
         f = metadata.get("field", {})
         self.field.Z = f.get("Z", 1)
         self.field.enable_coulomb = f.get("enable_coulomb", True)
+        # FIX BUG-004: Sync hamiltonian.include_coulomb with field
+        self.hamiltonian.include_coulomb = self.field.enable_coulomb
         
         h = metadata.get("hamiltonian", {})
         self.hamiltonian.evolution_mode = h.get("evolution_mode", "stationary")
@@ -1689,7 +1783,18 @@ class DiracSolver:
         
         self.superposition._coeffs = np.asarray(coeffs, dtype=np.complex128)
         self._time = metadata.get("time", 0.0)
+        
+        # FIX IO-001: Properly invalidate ALL caches after load
         self._spinor_stack_valid = False
+        self._dipole_cache.clear()
+        self._sph_harm_cache.clear()
+        
+        # FIX NEW-001: Compute _c_current at the loaded time for consistency
+        # Must be done after spinor_stack invalidation but before transition setup
+        if self._time != 0.0 and self.superposition.n_states() > 0:
+            self._c_current = self._coefficients_at_time(self._time)
+        else:
+            self._c_current = self.superposition.coeffs.copy()
         
         trans_data = metadata.get("transition")
         if trans_data and self.hamiltonian.evolution_mode == "driven":
